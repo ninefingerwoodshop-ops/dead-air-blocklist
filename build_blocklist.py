@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Build the Dead Air scam-number list from FTC Do Not Call complaint data.
 
-The FTC publishes one CSV per business day of numbers consumers reported:
-https://www.ftc.gov/policy-notices/open-government/data-sets/do-not-call-data
+Source: the FTC's official Do Not Call reported calls API
+https://www.ftc.gov/developer/api/v0/endpoints/do-not-call-dnc-reported-calls-data-api
+(free key from https://api.data.gov/signup, passed as FTC_API_KEY).
 
-This script pulls the last WINDOW_DAYS of those files, counts reports per
-number, and writes two tiers into a compact binary file the app downloads:
+The API returns at most 50 complaints per request and a free key allows
+roughly 1,000 requests an hour, while a month of complaints is ~6,000
+requests. So collection is incremental:
 
-  block  — reported >= BLOCK_MIN times: the phone blocks the call outright
-  label  — reported >= LABEL_MIN times: the phone shows "Reported scam"
+  1. collect — for each finished day in the window that we don't have yet,
+     page through that day's complaints (one hour at a time, so paging never
+     goes deep) and save a per-day tally to daily/YYYY-MM-DD.tsv
+     ("number<TAB>reports"). A day is only written once it's complete.
+     Stops early when the request budget runs low; the next run resumes.
+  2. build — add up the daily tallies for the last WINDOW_DAYS and write
+     two tiers into a compact binary file the app downloads:
+
+       block  — reported >= BLOCK_MIN times: the phone blocks the call
+       label  — reported >= LABEL_MIN times: caller ID says "Reported scam"
 
 Reports are unverified and scammers spoof innocent numbers, so the bar for
 blocking is deliberately high; most numbers are only labeled.
 
-Output (in OUT_DIR):
+Output (in --out):
   blocklist.bin   — see FORMAT below
   manifest.json   — tiny; the app checks it before downloading the list
 
@@ -30,8 +40,8 @@ FORMAT (all little-endian):
   A number appears in at most one list.
 
 Stdlib only. Usage:
-  python3 build_blocklist.py                      # fetch from the FTC
-  python3 build_blocklist.py --csv a.csv b.csv    # build from local files
+  FTC_API_KEY=... python3 build_blocklist.py --out .   # collect + build
+  python3 build_blocklist.py --csv a.csv --out .       # build from FTC CSV exports
 """
 
 from __future__ import annotations
@@ -40,18 +50,19 @@ import argparse
 import csv
 import datetime as dt
 import hashlib
-import io
 import json
 import os
 import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from typing import Iterable
 
-FTC_URL = "https://www.ftc.gov/sites/default/files/DNC_Complaint_Numbers_{date}.csv"
+API_URL = "https://api.ftc.gov/v0/dnc-complaints"
+PAGE_SIZE = 50  # the API's maximum
 MAGIC = b"DABL"
 FORMAT_VERSION = 1
 
@@ -60,6 +71,16 @@ LABEL_MIN = int(os.environ.get("LABEL_MIN", 3))
 BLOCK_MIN = int(os.environ.get("BLOCK_MIN", 10))
 # Hard ceiling so the download always stays small (the busiest numbers win).
 MAX_NUMBERS = int(os.environ.get("MAX_NUMBERS", 250_000))
+# Requests per run; stays under api.data.gov's default hourly limit.
+REQUEST_BUDGET = int(os.environ.get("REQUEST_BUDGET", 900))
+USER_AGENT = "dead-air-blocklist (github.com/ninefingerwoodshop-ops/dead-air-blocklist)"
+
+
+def annotate(level: str, message: str) -> None:
+    """A GitHub Actions annotation (readable through the API) plus a plain line."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::{level}::{message}")
+    print(message, file=sys.stderr)
 
 
 # --- numbers -----------------------------------------------------------------
@@ -79,10 +100,10 @@ def normalize(raw: str) -> int | None:
     return int("1" + digits)
 
 
-def count_reports(rows: Iterable[dict]) -> Counter:
+def count_numbers(raw_numbers: Iterable[str]) -> Counter:
     counts: Counter = Counter()
-    for row in rows:
-        number = normalize(row.get("Company_Phone_Number") or "")
+    for raw in raw_numbers:
+        number = normalize(raw or "")
         if number is not None:
             counts[number] += 1
     return counts
@@ -154,94 +175,131 @@ def decode(data: bytes) -> tuple[list[int], list[int], dt.date]:
     return block, label, dt.date(1970, 1, 1) + dt.timedelta(days=day)
 
 
-# --- fetching ----------------------------------------------------------------
+# --- daily tallies -----------------------------------------------------------
 
-USER_AGENT = "dead-air-blocklist (github.com/ninefingerwoodshop-ops/dead-air-blocklist)"
-
-
-def annotate(level: str, message: str) -> None:
-    """Print a GitHub Actions annotation (readable through the API) and a plain line."""
-    if os.environ.get("GITHUB_ACTIONS"):
-        print(f"::{level}::{message}")
-    print(message, file=sys.stderr)
+def tally_path(daily_dir: str, day: dt.date) -> str:
+    return os.path.join(daily_dir, f"{day.isoformat()}.tsv")
 
 
-def fetch_day(date: dt.date) -> str | None:
-    """Returns the CSV text, or None if that day has no file (weekend, holiday,
-    not posted yet). Raises after retries on anything else."""
-    url = FTC_URL.format(date=date.isoformat())
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    last_error: Exception | None = None
-    for attempt in range(3):
+def write_tally(path: str, counts: Counter) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        for number in sorted(counts):
+            f.write(f"{number}\t{counts[number]}\n")
+    os.replace(tmp, path)  # a day appears only once it's complete
+
+
+def read_tally(path: str) -> Counter:
+    counts: Counter = Counter()
+    with open(path) as f:
+        for line in f:
+            number, reports = line.split("\t")
+            counts[int(number)] += int(reports)
+    return counts
+
+
+def window_days(today: dt.date) -> list[dt.date]:
+    """Finished days only (today's complaints are still coming in), newest first."""
+    return [today - dt.timedelta(days=offset) for offset in range(1, WINDOW_DAYS + 1)]
+
+
+def prune(daily_dir: str, today: dt.date) -> None:
+    keep = {tally_path(daily_dir, d) for d in window_days(today)}
+    for name in os.listdir(daily_dir):
+        path = os.path.join(daily_dir, name)
+        if name.endswith(".tsv") and path not in keep:
+            os.remove(path)
+
+
+# --- FTC API -----------------------------------------------------------------
+
+class BudgetExhausted(Exception):
+    pass
+
+
+class FTCClient:
+    def __init__(self, api_key: str, budget: int):
+        self.api_key = api_key
+        self.budget = budget
+        self.requests = 0
+
+    def get(self, params: dict) -> dict:
+        if self.requests >= self.budget:
+            raise BudgetExhausted
+        url = API_URL + "?" + urllib.parse.urlencode(params)
+        # Key in a header so it never appears in URLs or logs.
+        request = urllib.request.Request(url, headers={"X-Api-Key": self.api_key, "User-Agent": USER_AGENT})
+        for attempt in range(4):
+            self.requests += 1
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    remaining = response.headers.get("X-RateLimit-Remaining")
+                    body = json.load(response)
+                if remaining is not None and int(remaining) < 10:
+                    self.budget = self.requests  # stop after this one
+                return body
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise BudgetExhausted from e
+                if e.code in (401, 403):
+                    raise RuntimeError(f"FTC API rejected the key (HTTP {e.code}). Check the FTC_API_KEY secret.") from e
+                if e.code < 500 or attempt == 3:
+                    raise RuntimeError(f"FTC API HTTP {e.code} for {params}") from e
+            except (urllib.error.URLError, TimeoutError) as e:
+                if attempt == 3:
+                    raise RuntimeError(f"FTC API unreachable: {e}") from e
+            time.sleep(5 * (attempt + 1))
+        raise RuntimeError("unreachable")
+
+    def numbers_for_day(self, day: dt.date) -> list[str]:
+        """Every complaint's number for one day, an hour at a time so the
+        offset never grows past a few hundred."""
+        numbers: list[str] = []
+        for hour in range(24):
+            start = f'"{day.isoformat()} {hour:02d}:00:00"'
+            end = f'"{day.isoformat()} {hour:02d}:59:59"'
+            offset = 0
+            while True:
+                body = self.get({
+                    "created_date_from": start,
+                    "created_date_to": end,
+                    "items_per_page": PAGE_SIZE,
+                    "offset": offset,
+                })
+                page = body.get("data") or []
+                numbers.extend((item.get("attributes") or {}).get("company-phone-number") or "" for item in page)
+                if len(page) < PAGE_SIZE:
+                    break
+                offset += PAGE_SIZE
+        return numbers
+
+
+def collect(client: FTCClient, daily_dir: str, today: dt.date) -> tuple[int, int]:
+    """Fetch missing days, newest first. Returns (days fetched, days still missing)."""
+    os.makedirs(daily_dir, exist_ok=True)
+    missing = [d for d in window_days(today) if not os.path.exists(tally_path(daily_dir, d))]
+    fetched = 0
+    for day in missing:
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                text = response.read().decode("utf-8-sig", errors="replace")
-                if not text.startswith("Company_Phone_Number"):
-                    raise ValueError(f"unexpected content: {text[:80]!r}")
-                return text
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            last_error = e
-        except (urllib.error.URLError, ValueError, TimeoutError) as e:
-            last_error = e
-        time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"{date}: {last_error}")
+            numbers = client.numbers_for_day(day)
+        except BudgetExhausted:
+            break
+        write_tally(tally_path(daily_dir, day), count_numbers(numbers))
+        fetched += 1
+        print(f"{day}: {len(numbers):,} complaints")
+    return fetched, len(missing) - fetched
 
 
-def fetch_window(today: dt.date) -> tuple[list[dict], int]:
-    """Skips days that fail (and says why); only a window with no data at all is fatal."""
-    rows: list[dict] = []
-    files = 0
-    for offset in range(WINDOW_DAYS):
-        day = today - dt.timedelta(days=offset)
-        try:
-            text = fetch_day(day)
-        except RuntimeError as e:
-            annotate("warning", f"FTC download failed for {e}")
-            continue
-        if text is None:
-            continue
-        files += 1
-        rows.extend(csv.DictReader(io.StringIO(text)))
-    return rows, files
+# --- build -------------------------------------------------------------------
 
-
-# --- main --------------------------------------------------------------------
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--csv", nargs="*", help="build from local CSV files instead of fetching")
-    parser.add_argument("--out", default=".", help="output directory")
-    parser.add_argument("--date", help="treat this as today (YYYY-MM-DD)")
-    args = parser.parse_args()
-
-    today = dt.date.fromisoformat(args.date) if args.date else dt.datetime.now(dt.timezone.utc).date()
-
-    if args.csv:
-        rows = []
-        for path in args.csv:
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                rows.extend(csv.DictReader(f))
-        files = len(args.csv)
-    else:
-        rows, files = fetch_window(today)
-
-    if files == 0 or not rows:
-        annotate("error", "No FTC data downloaded; leaving the existing list untouched.")
-        return 1
-
-    counts = count_reports(rows)
+def publish(counts: Counter, out_dir: str, today: dt.date, days_used: int) -> None:
     block, label = tiers(counts)
     data = encode(block, label, today)
-
-    # Round-trip check before publishing anything.
     if decode(data)[:2] != (block, label):
-        print("Encoding round-trip failed", file=sys.stderr)
-        return 1
+        raise RuntimeError("encoding round-trip failed")
 
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "blocklist.bin"), "wb") as f:
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "blocklist.bin"), "wb") as f:
         f.write(data)
     manifest = {
         "format": FORMAT_VERSION,
@@ -250,18 +308,59 @@ def main() -> int:
         "bytes": len(data),
         "block": len(block),
         "label": len(label),
+        "days": days_used,
         "window_days": WINDOW_DAYS,
         "label_min_reports": LABEL_MIN,
         "block_min_reports": BLOCK_MIN,
         "source": "FTC Do Not Call reported calls data",
     }
-    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
+    print(f"block {len(block):,} (>= {BLOCK_MIN} reports), label {len(label):,} (>= {LABEL_MIN}) "
+          f"from {days_used} days; blocklist.bin {len(data):,} bytes")
 
-    print(f"{files} FTC files, {len(rows):,} reports, {len(counts):,} distinct valid numbers")
-    print(f"block {len(block):,} (>= {BLOCK_MIN} reports), label {len(label):,} (>= {LABEL_MIN})")
-    print(f"blocklist.bin {len(data):,} bytes ({len(data) / max(1, len(block) + len(label)):.2f} bytes/number)")
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--csv", nargs="*", help="build from FTC CSV exports instead of the API")
+    parser.add_argument("--out", default=".", help="output directory")
+    parser.add_argument("--daily", default="daily", help="directory of per-day tallies")
+    parser.add_argument("--date", help="treat this as today (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    today = dt.date.fromisoformat(args.date) if args.date else dt.datetime.now(dt.timezone.utc).date()
+
+    if args.csv:
+        raw = []
+        for path in args.csv:
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                raw.extend(row.get("Company_Phone_Number") or "" for row in csv.DictReader(f))
+        publish(count_numbers(raw), args.out, today, days_used=len(args.csv))
+        return 0
+
+    api_key = os.environ.get("FTC_API_KEY")
+    if not api_key:
+        annotate("error", "FTC_API_KEY is not set. Add it as a repository secret (free key: https://api.data.gov/signup).")
+        return 1
+
+    client = FTCClient(api_key, REQUEST_BUDGET)
+    try:
+        fetched, remaining = collect(client, args.daily, today)
+    except RuntimeError as e:
+        annotate("error", str(e))
+        return 1
+    prune(args.daily, today)
+    annotate("notice", f"Fetched {fetched} day(s) in {client.requests} requests; {remaining} day(s) still to backfill.")
+
+    days = [d for d in window_days(today) if os.path.exists(tally_path(args.daily, d))]
+    if not days:
+        annotate("error", "No complete days collected yet; nothing to publish.")
+        return 1
+    counts: Counter = Counter()
+    for d in days:
+        counts.update(read_tally(tally_path(args.daily, d)))
+    publish(counts, args.out, today, days_used=len(days))
     return 0
 
 

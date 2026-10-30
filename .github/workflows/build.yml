@@ -2,8 +2,10 @@ name: Build scam list
 
 on:
   schedule:
-    # Mondays 16:37 UTC — after the FTC posts Monday's file (weekend data) by noon ET.
-    - cron: "37 16 * * 1"
+    # Every 3 hours. Most runs fetch nothing (yesterday is already in) and
+    # commit nothing; the extra runs let the first 30-day backfill finish in
+    # about a day within the free API key's hourly limit.
+    - cron: "37 */3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -27,7 +29,9 @@ jobs:
       - name: Test
         run: python -m unittest -v test_build_blocklist
 
-      - name: Build from the last 30 days of FTC data
+      - name: Collect FTC data and build the list
+        env:
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
         run: |
           set -o pipefail
           python build_blocklist.py --out . | tee build.log
@@ -36,13 +40,12 @@ jobs:
 
       - name: Publish if changed
         run: |
-          if git diff --quiet -- blocklist.bin manifest.json && \
-             [ -z "$(git ls-files --others --exclude-standard -- blocklist.bin manifest.json)" ]; then
-            echo "List unchanged."
+          if [ -z "$(git status --porcelain -- blocklist.bin manifest.json daily)" ]; then
+            echo "Nothing changed."
             exit 0
           fi
           git config user.name "dead-air-bot"
           git config user.email "dead-air-bot@users.noreply.github.com"
-          git add blocklist.bin manifest.json
+          git add -A blocklist.bin manifest.json daily
           git commit -m "Scam list $(date -u +%F)"
           git push

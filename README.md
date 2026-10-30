@@ -2,12 +2,13 @@
 
 The public list of reported scam phone numbers used by [Dead Air](https://github.com/ninefingerwoodshop-ops/dead-air), a free iPhone scam call and text blocker.
 
-Every Monday a GitHub Action pulls the last 30 days of the FTC's [Do Not Call reported calls data](https://www.ftc.gov/policy-notices/open-government/data-sets/do-not-call-data), counts reports per number, and publishes:
+A GitHub Action collects complaints from the FTC's official [Do Not Call reported calls API](https://www.ftc.gov/developer/api/v0/endpoints/do-not-call-dnc-reported-calls-data-api) one finished day at a time, keeps a per-day tally in `daily/`, and rebuilds the list from the last 30 days. It runs every 3 hours; most runs have nothing new to fetch. The API allows 50 complaints per request, so the first 30-day backfill spreads across several runs.
 
 | File | What |
 | --- | --- |
 | `manifest.json` | A few hundred bytes. The app checks this first and only downloads the list when it changed. |
 | `blocklist.bin` | The list. Sorted, delta-encoded, about 3 bytes per number. Format documented in `build_blocklist.py`. |
+| `daily/YYYY-MM-DD.tsv` | Per-day report counts (`number<TAB>reports`), only written once a day is complete. |
 
 ## Tiers
 
@@ -22,12 +23,16 @@ FTC reports are unverified, and scammers fake real people's numbers, so most num
 
 The app only downloads these two files. It never uploads anything about the user.
 
+## Setup
+
+The Action needs a free api.data.gov key in the repository secret `FTC_API_KEY` (get one at https://api.data.gov/signup).
+
 ## Run it
 
 ```sh
 python3 -m unittest test_build_blocklist
-python3 build_blocklist.py --out .                 # fetch from the FTC
-python3 build_blocklist.py --csv day.csv --out .   # or from local CSVs
+FTC_API_KEY=... python3 build_blocklist.py --out .   # collect + build
+python3 build_blocklist.py --csv day.csv --out .     # or from FTC CSV exports
 ```
 
 Stdlib-only Python 3.10+. Run the Action by hand from the Actions tab ("Build scam list" → Run workflow).
