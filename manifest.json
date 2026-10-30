@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "generated": "2026-10-30",
+  "sha256": "5b093c067912940fa25b1bcf5e191c737d78fb1f74b6d71827d7909b9679c066",
+  "bytes": 1493,
+  "block": 42,
+  "label": 421,
+  "days": 2,
+  "window_days": 30,
+  "label_min_reports": 3,
+  "block_min_reports": 10,
+  "source": "FTC Do Not Call reported calls data"
+}
