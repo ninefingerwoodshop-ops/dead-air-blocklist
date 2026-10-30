@@ -31,14 +31,14 @@ jobs:
 
       - name: Check the API key is visible (never prints it)
         env:
-          SECRET_KEY: ${{ secrets.FTC_API_KEY }}
-          VARIABLE_KEY: ${{ vars.FTC_API_KEY }}
+          SECRET_KEY: ${{ secrets.FTC_API_KEY || secrets.FTC_APIKEY || secrets.API_DATA_GOV }}
         run: |
-          echo "::notice::FTC_API_KEY as repository secret: $([ -n "$SECRET_KEY" ] && echo found || echo missing); as variable: $([ -n "$VARIABLE_KEY" ] && echo found || echo missing)"
+          echo "::notice::FTC API key: $([ -n "$SECRET_KEY" ] && echo found || echo missing)"
 
       - name: Collect FTC data and build the list
         env:
-          FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
+          # Any of these secret names works.
+          FTC_API_KEY: ${{ secrets.FTC_API_KEY || secrets.FTC_APIKEY || secrets.API_DATA_GOV }}
         run: |
           set -o pipefail
           python build_blocklist.py --out . | tee build.log
