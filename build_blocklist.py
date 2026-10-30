@@ -156,31 +156,50 @@ def decode(data: bytes) -> tuple[list[int], list[int], dt.date]:
 
 # --- fetching ----------------------------------------------------------------
 
+USER_AGENT = "dead-air-blocklist (github.com/ninefingerwoodshop-ops/dead-air-blocklist)"
+
+
+def annotate(level: str, message: str) -> None:
+    """Print a GitHub Actions annotation (readable through the API) and a plain line."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::{level}::{message}")
+    print(message, file=sys.stderr)
+
+
 def fetch_day(date: dt.date) -> str | None:
+    """Returns the CSV text, or None if that day has no file (weekend, holiday,
+    not posted yet). Raises after retries on anything else."""
     url = FTC_URL.format(date=date.isoformat())
-    request = urllib.request.Request(url, headers={"User-Agent": "dead-air-blocklist (github.com/ninefingerwoodshop-ops/dead-air-blocklist)"})
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_error: Exception | None = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
-                return response.read().decode("utf-8-sig", errors="replace")
+                text = response.read().decode("utf-8-sig", errors="replace")
+                if not text.startswith("Company_Phone_Number"):
+                    raise ValueError(f"unexpected content: {text[:80]!r}")
+                return text
         except urllib.error.HTTPError as e:
-            if e.code == 404:  # weekends, holidays, not posted yet
+            if e.code == 404:
                 return None
-            if attempt == 2:
-                raise
-        except urllib.error.URLError:
-            if attempt == 2:
-                raise
+            last_error = e
+        except (urllib.error.URLError, ValueError, TimeoutError) as e:
+            last_error = e
         time.sleep(5 * (attempt + 1))
-    return None
+    raise RuntimeError(f"{date}: {last_error}")
 
 
 def fetch_window(today: dt.date) -> tuple[list[dict], int]:
+    """Skips days that fail (and says why); only a window with no data at all is fatal."""
     rows: list[dict] = []
     files = 0
     for offset in range(WINDOW_DAYS):
         day = today - dt.timedelta(days=offset)
-        text = fetch_day(day)
+        try:
+            text = fetch_day(day)
+        except RuntimeError as e:
+            annotate("warning", f"FTC download failed for {e}")
+            continue
         if text is None:
             continue
         files += 1
@@ -209,7 +228,7 @@ def main() -> int:
         rows, files = fetch_window(today)
 
     if files == 0 or not rows:
-        print("No FTC data found; leaving the existing list untouched.", file=sys.stderr)
+        annotate("error", "No FTC data downloaded; leaving the existing list untouched.")
         return 1
 
     counts = count_reports(rows)
