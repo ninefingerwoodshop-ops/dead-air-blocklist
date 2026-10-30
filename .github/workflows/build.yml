@@ -29,6 +29,13 @@ jobs:
       - name: Test
         run: python -m unittest -v test_build_blocklist
 
+      - name: Check the API key is visible (never prints it)
+        env:
+          SECRET_KEY: ${{ secrets.FTC_API_KEY }}
+          VARIABLE_KEY: ${{ vars.FTC_API_KEY }}
+        run: |
+          echo "::notice::FTC_API_KEY as repository secret: $([ -n "$SECRET_KEY" ] && echo found || echo missing); as variable: $([ -n "$VARIABLE_KEY" ] && echo found || echo missing)"
+
       - name: Collect FTC data and build the list
         env:
           FTC_API_KEY: ${{ secrets.FTC_API_KEY }}
