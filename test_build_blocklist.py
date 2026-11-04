@@ -1,6 +1,13 @@
+import base64
 import datetime as dt
+import json
+import os
 import random
+import shutil
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 import build_blocklist as b
 
@@ -97,8 +104,68 @@ class CollectTests(unittest.TestCase):
             self.assertEqual((fetched, remaining), (2, b.WINDOW_DAYS - 4))
 
 
+def openssl_has_ed25519() -> bool:
+    if not shutil.which("openssl"):
+        return False
+    out = subprocess.run(["openssl", "version"], capture_output=True, text=True).stdout
+    return out.startswith("OpenSSL 3")
+
+
+@unittest.skipUnless(openssl_has_ed25519(), "needs OpenSSL 3")
+class SigningTests(unittest.TestCase):
+    def test_pinned_signature(self):
+        """Shared with the app's Swift signature test: same key, bytes, signature."""
+        data = bytes.fromhex(FIXTURE_HEX)
+        self.assertEqual(b.sign(data, TEST_SIGNING_KEY), FIXTURE_SIGNATURE)
+        pem = f"-----BEGIN PRIVATE KEY-----\n{TEST_SIGNING_KEY}\n-----END PRIVATE KEY-----\n"
+        self.assertEqual(b.sign(data, pem), FIXTURE_SIGNATURE)
+
+    def test_publish_signs_manifest(self):
+        counts = b.count_numbers(["7252099152"] * b.BLOCK_MIN)
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {b.SIGNING_KEY_ENV: TEST_SIGNING_KEY}):
+            b.publish(counts, d, dt.date(2026, 10, 30), days_used=1)
+            with open(os.path.join(d, "manifest.json")) as f:
+                manifest = json.load(f)
+            with open(os.path.join(d, "blocklist.bin"), "rb") as f:
+                data = f.read()
+        self.assertEqual(manifest["signature"], b.sign(data, TEST_SIGNING_KEY))
+        self.assertEqual(len(base64.b64decode(manifest["signature"])), 64)
+
+    def test_bad_key_fails_without_writing(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {b.SIGNING_KEY_ENV: "not a key"}):
+            with self.assertRaises(RuntimeError):
+                b.publish(b.count_numbers([]), d, dt.date(2026, 10, 30), days_used=1)
+            self.assertEqual(os.listdir(d), [])
+
+
+class UnsignedTests(unittest.TestCase):
+    def test_actions_refuses_to_publish_unsigned(self):
+        env = {k: v for k, v in os.environ.items() if k != b.SIGNING_KEY_ENV}
+        env["GITHUB_ACTIONS"] = "true"
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(RuntimeError):
+                b.publish(b.count_numbers([]), d, dt.date(2026, 10, 30), days_used=1)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_local_build_without_key_is_unsigned(self):
+        env = {k: v for k, v in os.environ.items() if k not in (b.SIGNING_KEY_ENV, "GITHUB_ACTIONS")}
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, env, clear=True):
+            b.publish(b.count_numbers([]), d, dt.date(2026, 10, 30), days_used=1)
+            with open(os.path.join(d, "manifest.json")) as f:
+                self.assertNotIn("signature", json.load(f))
+
+
 # Pinned bytes — if this changes, the app's decoder test must change too.
 FIXTURE_HEX = "4441424c01145100000100000002000000828bd5fa41f7acb8a934c8a29dd10d"
+
+# TEST-ONLY Ed25519 key (PKCS#8 base64). Published on purpose so the app's
+# Swift test can check the same signature; it signs nothing real. The real
+# key lives only in the BLOCKLIST_SIGNING_KEY secret and the owner's Keychain.
+TEST_SIGNING_KEY = "MC4CAQAwBQYDK2VwBCIEIDSzIzzj/06YvTDooKtwgMAamhtUGl/0cLtoNzwtppV3"
+TEST_PUBLIC_KEY = "qNVBY08Ins4R3dOXEVzFTXt8c90rhL9O3xcOI9anFKo="  # raw 32 bytes, pinned in the Swift test
+FIXTURE_SIGNATURE = "h75tCAHFkqugGCCie9ZsneshZdTDQddMVYIJhTGxtEZkMBla/R/cwjxXbGilZgDLDFrIo7m1xEiLG7I/iMedCg=="
 
 if __name__ == "__main__":
     unittest.main()
