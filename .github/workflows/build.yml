@@ -29,16 +29,21 @@ jobs:
       - name: Test
         run: python -m unittest -v test_build_blocklist
 
-      - name: Check the API key is visible (never prints it)
+      - name: Check the keys are visible (never prints them)
         env:
           SECRET_KEY: ${{ secrets.FTC_API_KEY || secrets.FTC_APIKEY || secrets.API_DATA_GOV }}
+          SIGNING_KEY: ${{ secrets.BLOCKLIST_SIGNING_KEY }}
         run: |
           echo "::notice::FTC API key: $([ -n "$SECRET_KEY" ] && echo found || echo missing)"
+          echo "::notice::Signing key: $([ -n "$SIGNING_KEY" ] && echo found || echo missing)"
+          openssl version
 
       - name: Collect FTC data and build the list
         env:
           # Any of these secret names works.
           FTC_API_KEY: ${{ secrets.FTC_API_KEY || secrets.FTC_APIKEY || secrets.API_DATA_GOV }}
+          # Ed25519 private key; without it the build refuses to publish.
+          BLOCKLIST_SIGNING_KEY: ${{ secrets.BLOCKLIST_SIGNING_KEY }}
         run: |
           set -o pipefail
           python build_blocklist.py --out . | tee build.log

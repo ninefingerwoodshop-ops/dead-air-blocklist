@@ -6,7 +6,7 @@ A GitHub Action collects complaints from the FTC's official [Do Not Call reporte
 
 | File | What |
 | --- | --- |
-| `manifest.json` | A few hundred bytes. The app checks this first and only downloads the list when it changed. |
+| `manifest.json` | A few hundred bytes. The app checks this first and only downloads the list when it changed. Carries the list's Ed25519 `signature`. |
 | `blocklist.bin` | The list. Sorted, delta-encoded, about 3 bytes per number. Format documented in `build_blocklist.py`. |
 | `daily/YYYY-MM-DD.tsv` | Per-day report counts (`number<TAB>reports`), only written once a day is complete. |
 
@@ -23,9 +23,18 @@ FTC reports are unverified, and scammers fake real people's numbers, so most num
 
 The app only downloads these two files. It never uploads anything about the user.
 
+## Signing
+
+Every list is signed with an Ed25519 key, and the app only installs a list whose signature checks out against the public key built into it. Someone who could push to this repo still couldn't get a list onto anyone's phone without that key.
+
+The private key lives in two places only: the repository secret `BLOCKLIST_SIGNING_KEY` and the owner's macOS Keychain ("Dead Air blocklist signing key"). `tools/new-signing-key.sh` creates it, stores it in both, and prints the public key to pin in the app. Rotating the key means shipping an app update with the new public key *before* switching the secret.
+
 ## Setup
 
-The Action needs a free api.data.gov key in the repository secret `FTC_API_KEY` (get one at https://api.data.gov/signup).
+The Action needs two repository secrets:
+
+- `FTC_API_KEY`: a free api.data.gov key (get one at https://api.data.gov/signup)
+- `BLOCKLIST_SIGNING_KEY`: created by `tools/new-signing-key.sh` (needs OpenSSL 3 and a logged-in `gh`)
 
 ## Run it
 
@@ -35,4 +44,4 @@ FTC_API_KEY=... python3 build_blocklist.py --out .   # collect + build
 python3 build_blocklist.py --csv day.csv --out .     # or from FTC CSV exports
 ```
 
-Stdlib-only Python 3.10+. Run the Action by hand from the Actions tab ("Build scam list" → Run workflow).
+Stdlib-only Python 3.10+; signing uses the `openssl` CLI (OpenSSL 3). Without `BLOCKLIST_SIGNING_KEY` a local build is unsigned and the app won't install it. Run the Action by hand from the Actions tab ("Build scam list" → Run workflow).

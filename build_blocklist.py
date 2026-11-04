@@ -25,7 +25,10 @@ blocking is deliberately high; most numbers are only labeled.
 
 Output (in --out):
   blocklist.bin   — see FORMAT below
-  manifest.json   — tiny; the app checks it before downloading the list
+  manifest.json   — tiny; the app checks it before downloading the list.
+                    "signature" is the base64 Ed25519 signature of
+                    blocklist.bin; the app only installs a list that
+                    verifies against the public key pinned in it.
 
 FORMAT (all little-endian):
   4 bytes   magic "DABL"
@@ -39,7 +42,12 @@ FORMAT (all little-endian):
   number in the same list (the first is the difference from 0).
   A number appears in at most one list.
 
-Stdlib only. Usage:
+SIGNING: set BLOCKLIST_SIGNING_KEY to the Ed25519 private key (PKCS#8 PEM,
+or just its one-line base64 body). Create it with tools/new-signing-key.sh.
+Inside GitHub Actions an unsigned list is never published. Signatures are
+deterministic (RFC 8032), so rebuilding the same bytes gives the same manifest.
+
+Stdlib only; signing shells out to the openssl CLI (OpenSSL 3). Usage:
   FTC_API_KEY=... python3 build_blocklist.py --out .   # collect + build
   python3 build_blocklist.py --csv a.csv --out .       # build from FTC CSV exports
 """
@@ -47,13 +55,16 @@ Stdlib only. Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import hashlib
 import json
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -290,6 +301,43 @@ def collect(client: FTCClient, daily_dir: str, today: dt.date) -> tuple[int, int
     return fetched, len(missing) - fetched
 
 
+# --- signing -----------------------------------------------------------------
+
+SIGNING_KEY_ENV = "BLOCKLIST_SIGNING_KEY"
+
+
+def sign(data: bytes, key: str) -> str:
+    """Base64 Ed25519 signature of data. The key never touches the output."""
+    key = key.strip()
+    if "BEGIN" not in key:
+        key = f"-----BEGIN PRIVATE KEY-----\n{key}\n-----END PRIVATE KEY-----"
+    with tempfile.TemporaryDirectory() as tmp:
+        key_path = os.path.join(tmp, "key.pem")
+        data_path = os.path.join(tmp, "data.bin")
+        with os.fdopen(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(key + "\n")
+        with open(data_path, "wb") as f:
+            f.write(data)
+        result = subprocess.run(
+            ["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", key_path, "-in", data_path],
+            capture_output=True)
+    if result.returncode != 0 or len(result.stdout) != 64:
+        raise RuntimeError("openssl couldn't make an Ed25519 signature; "
+                           f"check {SIGNING_KEY_ENV} and that openssl is version 3")
+    return base64.b64encode(result.stdout).decode()
+
+
+def signature_for(data: bytes) -> str | None:
+    key = os.environ.get(SIGNING_KEY_ENV, "")
+    if key.strip():
+        return sign(data, key)
+    if os.environ.get("GITHUB_ACTIONS"):
+        raise RuntimeError(f"{SIGNING_KEY_ENV} is not set; refusing to publish an unsigned list. "
+                           "Create it with tools/new-signing-key.sh.")
+    annotate("warning", f"{SIGNING_KEY_ENV} is not set; the app won't install this unsigned list.")
+    return None
+
+
 # --- build -------------------------------------------------------------------
 
 def publish(counts: Counter, out_dir: str, today: dt.date, days_used: int) -> None:
@@ -297,6 +345,7 @@ def publish(counts: Counter, out_dir: str, today: dt.date, days_used: int) -> No
     data = encode(block, label, today)
     if decode(data)[:2] != (block, label):
         raise RuntimeError("encoding round-trip failed")
+    signature = signature_for(data)  # before writing anything, so a failure leaves no half-built output
 
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "blocklist.bin"), "wb") as f:
@@ -314,6 +363,8 @@ def publish(counts: Counter, out_dir: str, today: dt.date, days_used: int) -> No
         "block_min_reports": BLOCK_MIN,
         "source": "FTC Do Not Call reported calls data",
     }
+    if signature:
+        manifest["signature"] = signature
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
@@ -364,5 +415,13 @@ def main() -> int:
     return 0
 
 
+def run() -> int:
+    try:
+        return main()
+    except RuntimeError as e:
+        annotate("error", str(e))
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())
