@@ -9,5 +9,6 @@
   "window_days": 30,
   "label_min_reports": 3,
   "block_min_reports": 10,
-  "source": "FTC Do Not Call reported calls data"
+  "source": "FTC Do Not Call reported calls data",
+  "signature": "NZ1gjiz5OkrYd23AwFXHI2O5z311MqnMzrosx4wtS1gVA4nNyAwoarVFhXtDiY2uwAbsRpD2kzBqnkTEuO2uCA=="
 }
