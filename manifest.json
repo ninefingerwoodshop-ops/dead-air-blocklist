@@ -1,14 +1,14 @@
 {
   "format": 1,
-  "generated": "2026-11-20",
-  "sha256": "dd18ff56f51d191985d0ed88538cef9c6573f06f0f1707fdcceb80121136d10f",
-  "bytes": 5705,
-  "block": 173,
-  "label": 1830,
+  "generated": "2026-11-21",
+  "sha256": "142232d3fdb6168ef0772494bab244a7b2b8266cabe0c3b5bcfdef0a0b9bd359",
+  "bytes": 4743,
+  "block": 134,
+  "label": 1485,
   "days": 30,
   "window_days": 30,
   "label_min_reports": 3,
   "block_min_reports": 10,
   "source": "FTC Do Not Call reported calls data",
-  "signature": "hKkSnME515CPKUstaUrsKGWnwOfK7rKkI5Cfz8NqmH2TKbD2To4JokgVSr4Ou5MIDYZge60hIQgebNZnZT1nBQ=="
+  "signature": "fKDaRPToSUG2TI0bZ0Z5pykmCb1TNpC1RQcBEXwoFtp9JhiP0p1bCggBSSsxT0eo/pln3YB5GZUnD4m0Hph6AA=="
 }
